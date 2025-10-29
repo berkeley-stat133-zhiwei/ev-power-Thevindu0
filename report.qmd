@@ -8,16 +8,129 @@ format: typst
 ## **Part 0: libraries**
 
 ```{r}
+library(tidyverse)
+library(stringr)
+library(ggplot2)
+RU21 <- read.csv("data/renew-use-2021.csv")
+RU22 <- read.csv("data/renew-use-2022.csv")
+RU23 <- read.csv("data/renew-use-2023.csv")
 
+TEU21 <- read.csv("data/total-use-2021.csv")
+TEU22 <- read.csv("data/total-use-2022.csv")
+TEU23 <- read.csv("data/total-use-2023.csv")
+
+EV_by_state <- read.csv("data/ev-registrations-by-state-2023.csv")
+
+AV_by_state <- read.csv("data/av-energy-price-2021-2023.csv")
+
+
+state_lookup <- tibble(
+  abb   = state.abb,
+  name  = state.name,
+  lower = tolower(state.name)
+)
+
+# ---- Harmonize state names ----
+harmonize_state <- function(df, col) {
+  col <- enquo(col)
+  df |>
+    mutate(
+      .state_raw = str_squish(as.character(!!col)),
+      state = case_when(
+        .state_raw %in% state_lookup$name ~ .state_raw,
+        .state_raw %in% state_lookup$abb  ~ state_lookup$name[match(.state_raw, state_lookup$abb)],
+        TRUE ~ .state_raw
+      ),
+      state = str_to_title(state),
+      state_lower = tolower(state)
+    ) |>
+    select(-.state_raw)
+}
 ```
 
 ## **Part 1:** **Defining Research Question**
 
-Chosen Question:
+Chosen Question: How are different cities in different states contributing to the renewable energy share by state?
 
 ## **Part 2: Data Preparation and Cleaning**
-
 ```{r}
+library(tidyverse)
+library(stringr)
+
+RU21_clean <- RU21 |>
+  rename(
+    state = state,
+    energy_source = energy_source,
+    energy_value = energy_value
+  ) |>
+  mutate(
+    year = 2021,
+    state = str_to_title(state)
+  )
+
+RU22_clean <- RU22 |>
+  rename(
+    state = State,
+    energy_source = Energy_Source,
+    energy_value = Renewable_Use_2022
+  ) |>
+  mutate(
+    year = 2022,
+    state = str_to_title(state),
+    energy_value = str_remove_all(energy_value, "[$≈~[:alpha:]]"),  # remove symbols and letters
+    energy_value = as.numeric(energy_value)
+  )
+
+RU23_clean <- RU23 |>
+  rename(
+    state = State,
+    energy_source = Energy_Source,
+    energy_value = Renewable_Use_2023
+  ) |>
+  mutate(
+    year = 2023,
+    state = str_to_title(state),
+    energy_value = str_remove_all(energy_value, "[$≈~[:alpha:]]"),
+    energy_value = as.numeric(energy_value)
+  )
+
+#Combine
+renew_clean <- bind_rows(RU21_clean, RU22_clean, RU23_clean)
+#   reshape any TEU dataset
+clean_total <- function(df, year) {
+  df |>
+    pivot_longer(
+      cols = -Energy_Source,
+      names_to = "state",
+      values_to = "energy_value"
+    ) |>
+    mutate(
+      year = year,
+      energy_source = str_to_title(Energy_Source),
+      energy_value = as.numeric(str_remove_all(energy_value, "[^0-9\\.]")),
+      state = str_to_title(state)
+    ) |>
+    select(state, energy_source, energy_value, year)
+}
+
+TEU21_clean <- clean_total(TEU21, 2021)
+TEU22_clean <- clean_total(TEU22, 2022)
+TEU23_clean <- clean_total(TEU23, 2023)
+
+total_clean <- bind_rows(TEU21_clean, TEU22_clean, TEU23_clean)
+EV_clean <- EV_by_state |>
+  rename(
+    state = X,
+    energy_value = electric.vehicle.registrations_by_state..2023.
+  ) |>
+  mutate(
+    year = 2023,
+    energy_source = "EV Registrations",
+    state = str_to_title(state),
+    energy_value = str_remove_all(energy_value, "[^0-9]"),
+    energy_value = as.numeric(energy_value)
+  ) |>
+  select(state, energy_source, energy_value, year)
 
 ```
 
@@ -25,10 +138,70 @@ Chosen Question:
 
 ```{r}
 
+
+renew_vs_total <- renew_clean |>
+  filter(energy_source %in% c("Biomass", "Geothermal", "Hydropower", "Solar Energy", "Wind Energy")) |>
+  group_by(state, year) |>
+  summarise(renewable_total = sum(energy_value, na.rm = TRUE)) |>
+  left_join(
+    total_clean |>
+      filter(!str_detect(energy_source, regex("renewable", ignore_case = TRUE))) |>
+      group_by(state, year) |>
+      summarise(total_use = sum(energy_value, na.rm = TRUE)),
+    by = c("state", "year")
+  ) |>
+  mutate(
+    pct_renewable = round((renewable_total / total_use) * 100, 2)
+  )
+
+EV_clean <- EV_by_state[, 1:2] |>
+  setNames(c("state", "ev_raw")) |>
+  mutate(
+    state = str_to_title(str_squish(state)),
+    EV_registrations = as.numeric(str_remove_all(as.character(ev_raw), "[^0-9]")),
+    year = 2023
+  ) |>
+  select(state, EV_registrations, year)
+
+energy_ev <- renew_vs_total |>
+  left_join(EV_clean, by = c("state", "year")) |>
+  mutate(
+    EV_ratio = round(100 * EV_registrations / total_use, 4)
+  )
+
+
+AV_clean <- AV_by_state |>
+  separate(col = 1, into = c("state", "val_2021", "val_2022", "val_2023"), sep = ",") |>
+  pivot_longer(
+    cols = starts_with("val_"),
+    names_to = "year",
+    values_to = "energy_value"
+  ) |>
+  mutate(
+    year = as.numeric(str_remove(year, "val_")),
+    state = str_to_title(state),
+    energy_value = as.numeric(str_remove_all(as.character(energy_value), "[^0-9\\.]"))
+  ) |>
+  rename(avg_energy_price = energy_value)
+
+full_energy <- energy_ev |>
+  left_join(AV_clean, by = c("state", "year"))
+
 ```
 
 ## **Part 4: Mapping Visualization**
 
 ```{r}
+library(ggplot2)
+
+ggplot(full_energy |> filter(year == 2023),
+       aes(x = reorder(state, -pct_renewable), y = pct_renewable, fill = pct_renewable)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Renewable Energy Share by State (2023)",
+       x = "State", y = "% Renewable Energy") +
+  theme_minimal()
+
 
 ```
+
